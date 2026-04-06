@@ -1,0 +1,184 @@
+name: sbt-changesets
+description: Changeset-based versioning for Scala multi-module builds. Detect affected modules, publish snapshots, and release.
+
+branding:
+  icon: package
+  color: red
+
+inputs:
+  mode:
+    description: "'detect' to validate changesets and output affected modules, 'snapshot' for PR snapshots, 'release' for main branch publishing"
+    required: true
+  pr-number:
+    description: "PR number for snapshot comment (defaults to github.event.pull_request.number)"
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  github-token:
+    description: "GitHub token for API operations (defaults to github.token)"
+    required: false
+    default: ${{ github.token }}
+  error-help-url:
+    description: "URL to display on changeset validation failure (e.g. link to versioning docs)"
+    required: false
+    default: ""
+
+outputs:
+  affected:
+    description: "JSON array of affected module names (only set when mode is 'detect')"
+    value: ${{ steps.detect.outputs.affected }}
+  result:
+    description: "'version-pr' if a version PR was created/updated, 'published' if artifacts were published, 'no-changes' otherwise"
+    value: ${{ steps.release-result.outputs.result }}
+  branch:
+    description: "The release branch name (only set when result is 'version-pr')"
+    value: ${{ steps.release-result.outputs.branch }}
+
+runs:
+  using: composite
+  steps:
+    # ─── Detect mode ─────────────────────────────
+
+    - name: Detect affected modules
+      if: inputs.mode == 'detect'
+      id: detect
+      shell: bash
+      run: |
+        sbt changesetAffected || {
+          if [ -n "${{ inputs.error-help-url }}" ]; then
+            echo "See: ${{ inputs.error-help-url }}"
+          fi
+          exit 1
+        }
+        echo "affected=$(jq -c . target/changeset/affected.json)" >> "$GITHUB_OUTPUT"
+
+    # ─── Snapshot mode ───────────────────────────
+
+    - name: Publish snapshots
+      if: inputs.mode == 'snapshot'
+      shell: bash
+      run: sbt publishSnapshot
+
+    - name: Comment snapshot coordinates on PR
+      if: inputs.mode == 'snapshot'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        COORDINATES_FILE="target/changeset/snapshot-coordinates.json"
+
+        if [ ! -f "$COORDINATES_FILE" ]; then
+          echo "No snapshot coordinates file found. Skipping comment."
+          exit 0
+        fi
+
+        BLOCKS=$(jq -r '.[] | "```scala\n\(.coordinate)\n```"' "$COORDINATES_FILE")
+        BODY_FILE=$(mktemp)
+
+        cat > "$BODY_FILE" <<EOF
+        ### Snapshot releases
+
+        Install with:
+
+        ${BLOCKS}
+
+        _Updated on each push to this PR._
+        EOF
+
+        # Try to update the last bot comment, fall back to creating a new one
+        gh pr comment "${{ inputs.pr-number }}" --edit-last --body-file "$BODY_FILE" 2>/dev/null \
+          || gh pr comment "${{ inputs.pr-number }}" --body-file "$BODY_FILE"
+
+        rm -f "$BODY_FILE"
+
+    # ─── Release mode ────────────────────────────
+
+    - name: Check for pending changesets
+      if: inputs.mode == 'release'
+      id: check
+      shell: bash
+      run: |
+        COUNT=$(find .changeset -name "*.md" ! -name "README.md" 2>/dev/null | wc -l | tr -d ' ')
+        echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+    # ─── Release: version PR path ────────────────
+
+    - name: Apply changesets and create version PR
+      if: inputs.mode == 'release' && steps.check.outputs.count != '0'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        BRANCH="changeset-release/main"
+
+        sbt changesetVersion
+
+        # Build markdown PR body from version summary JSON
+        SUMMARY_FILE=$(mktemp)
+        jq -r '"## Version Packages\n\n" + ([.[] | "- **\(.module)**: \(.old_version) → \(.new_version)"] | join("\n"))' \
+          target/changeset/version-summary.json > "$SUMMARY_FILE"
+
+        # Configure git
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        # Commit and force-push
+        git checkout -B "$BRANCH"
+        git add -A
+        git commit -m "Version Packages [skip ci]" || { echo "No changes to commit."; exit 0; }
+        git push --force origin "$BRANCH"
+
+        # Create or update PR
+        EXISTING=$(gh pr list --head "$BRANCH" --base main --state open --json number -q '.[0].number' 2>/dev/null || echo "")
+
+        if [ -n "$EXISTING" ]; then
+          gh pr edit "$EXISTING" --body-file "$SUMMARY_FILE"
+          echo "Updated PR #$EXISTING"
+        else
+          gh pr create --head "$BRANCH" --base main --title "Changesets: Version Packages" --body-file "$SUMMARY_FILE"
+        fi
+
+        rm -f "$SUMMARY_FILE"
+
+    # ─── Release: publish + releases path ────────
+
+    - name: Publish and create releases
+      if: inputs.mode == 'release' && steps.check.outputs.count == '0'
+      shell: bash
+      env:
+        RELEASE: "true"
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        sbt "generatePublishMarkers; +publish; changesetRelease"
+
+        RELEASE_FILE="target/changeset/release.json"
+
+        if [ ! -f "$RELEASE_FILE" ]; then
+          echo "No release file found. Skipping release creation."
+          exit 0
+        fi
+
+        jq -c '.[]' "$RELEASE_FILE" | while read -r release; do
+          TAG=$(echo "$release" | jq -r '.tag')
+          BODY=$(echo "$release" | jq -r '.body')
+          NOTES_FILE=$(mktemp)
+          echo "$BODY" > "$NOTES_FILE"
+
+          echo "Creating release: $TAG"
+          gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" --target main
+
+          rm -f "$NOTES_FILE"
+        done
+
+    # ─── Release: set outputs ────────────────────
+
+    - name: Set release outputs
+      if: inputs.mode == 'release'
+      id: release-result
+      shell: bash
+      run: |
+        if [ "${{ steps.check.outputs.count }}" != "0" ]; then
+          echo "result=version-pr" >> "$GITHUB_OUTPUT"
+          echo "branch=changeset-release/main" >> "$GITHUB_OUTPUT"
+        else
+          echo "result=published" >> "$GITHUB_OUTPUT"
+        fi
