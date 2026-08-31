@@ -23,13 +23,12 @@ import com.alejandrohdezma.sbt.modules.ModulesPlugin
 
 /** SBT AutoPlugin that provides changeset-based versioning for a multi-module build.
   *
-  * Requires `ModulesPlugin` to ensure `packageIsModule` and `publish / skip` settings are applied in the correct order.
+  * Requires `ModulesPlugin` for the `packageIsModule` setting used during version resolution.
   *
   * Provides:
   *
   *   - '''Per-module versioning''' from `VERSION` files in each module directory
   *   - '''SCM metadata''' (`scmInfo`, `homepage`) derived from the git remote URL
-  *   - '''Publish gating''' via `.publish` marker files (`publish / skip`)
   *   - '''Changeset commands''' for validating, versioning, and publishing modules
   *
   * ===Version Resolution===
@@ -49,26 +48,54 @@ object ChangesetPlugin extends AutoPlugin {
 
   object autoImport {
 
-    val changesetBaseBranch =
-      settingKey[String]("Remote branch reference used to detect changed modules (default: origin/main)")
+    val changesetBaseBranch = settingKey[String] {
+      "Remote branch reference used to detect changed modules (default: origin/main)"
+    }.withRank(KeyRanks.Invisible)
+
+    val changesetAffectedScopes = settingKey[Seq[String]] {
+      "Dependency scopes (the left-hand side of a `dependsOn` configuration, e.g. \"compile\" or \"test\") through " +
+        "which a change cascades into a *release*: a module is bumped when it depends on a changed module via one " +
+        "of these scopes, and a change confined to a source set outside them needs no changeset. Defaults to " +
+        "Seq(\"compile\", \"bom\") — a module depending on a changed module only via test scope is not released, " +
+        "while a BOM whose pins move is. Use \"*\" to match any scope. Note this does not narrow CI: the " +
+        "validate-stage matrix always covers every scope, marking such rows `validate-only`."
+    }.withRank(KeyRanks.Invisible)
+
+    val changesetAlwaysBump = settingKey[Boolean] {
+      "Whether this module receives at least a patch bump whenever `changesetVersion` applies any bump. Useful " +
+        "for modules that must be re-released with every release train (e.g. a BOM aggregating the build's " +
+        "artifacts) without declaring `dependsOn` on the rest of the build. A module already bumped — explicitly " +
+        "or through cascading — keeps its existing bump. When no changesets are pending, no bump is added. " +
+        "Defaults to false."
+    }.withRank(KeyRanks.Invisible)
+
+    val changesetCoordinate = settingKey[String] {
+      "Maven-style coordinate for this module, used as the `coordinate` field in the validate-stage matrix " +
+        "(consumed by `snapshot-comment`). Defaults to `\"org\" %% \"moduleName\" % \"version\"` for Scala modules " +
+        "and `\"org\" % \"moduleName\" % \"version\"` for Java modules (`crossPaths := false`); it tracks " +
+        "`moduleName`, so a module published under a different artifactId than its project name renders that " +
+        "artifactId. Override per-project for test-scoped modules (`... % \"test\"`) or custom artifact shapes."
+    }.withRank(KeyRanks.Invisible)
 
   }
 
   import autoImport.*
 
-  override def projectSettings: Seq[Setting[_]] = Seq(
-    publish / skip := Settings.skipPublish.value,
-    version        := Settings.versionFromFile.value,
-    versionScheme  := Some("early-semver"),
-    homepage       := scmInfo.value.map(_.browseUrl),
-    scmInfo        := Settings.scmInfoFromGit.value
+  override def projectSettings = Seq(
+    version             := Settings.versionFromFile.value,
+    versionScheme       := Some("early-semver"),
+    homepage            := scmInfo.value.map(_.browseUrl),
+    scmInfo             := Settings.scmInfoFromGit.value,
+    changesetAlwaysBump := false,
+    changesetCoordinate := s""""${organization.value}" ${Settings.separator.value} "${moduleName.value}" % "${version.value}""""
   )
 
-  override def buildSettings: Seq[Setting[_]] = Seq(
-    changesetBaseBranch := "origin/main"
+  override def buildSettings = Seq(
+    changesetBaseBranch     := "origin/main",
+    changesetAffectedScopes := Seq("compile", "bom")
   )
 
-  override def globalSettings: Seq[Setting[_]] = Seq(
+  override def globalSettings = Seq(
     commands ++= Commands.all
   )
 

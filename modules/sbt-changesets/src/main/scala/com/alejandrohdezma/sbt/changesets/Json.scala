@@ -28,6 +28,9 @@ sealed trait Json {
     case Json.JsonString(value) =>
       Json.str(value)
 
+    case Json.JsonBoolean(value) =>
+      value.toString
+
     case Json.JsonArray(values) if values.isEmpty =>
       "[]"
 
@@ -50,6 +53,8 @@ object Json {
 
   private case class JsonString(value: String) extends Json
 
+  private case class JsonBoolean(value: Boolean) extends Json
+
   private case class JsonArray(values: Seq[Json]) extends Json
 
   private case class JsonObject(entries: Seq[(String, Json)]) extends Json
@@ -64,8 +69,11 @@ object Json {
   /** Creates a JSON string value. */
   def apply(value: String): Json = JsonString(value)
 
+  /** Creates a JSON boolean value. */
+  def apply(value: Boolean): Json = JsonBoolean(value)
+
   /** Creates a JSON array from string items. */
-  def arr(items: String*): Json = JsonArray(items.map(JsonString))
+  def arr(items: String*): Json = JsonArray(items.map(JsonString.apply))
 
   /** Creates a JSON array from JSON items. */
   def arr(items: Json*)(implicit ev: DummyImplicit): Json = JsonArray(items)
@@ -79,6 +87,8 @@ object Json {
   implicit class StringJsonOps(val key: String) {
 
     def :=(value: String): (String, Json) = (key, JsonString(value))
+
+    def :=(value: Boolean): (String, Json) = (key, JsonBoolean(value))
 
   }
 

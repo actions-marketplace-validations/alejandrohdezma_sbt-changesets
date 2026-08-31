@@ -19,6 +19,7 @@ package com.alejandrohdezma.sbt.changesets
 import java.io.File
 import java.nio.file.Files
 
+import com.alejandrohdezma.sbt.modules.ModuleDependency
 import com.alejandrohdezma.sbt.modules.ModuleMetadata
 
 class ChangesetsSuite extends munit.FunSuite {
@@ -217,7 +218,10 @@ class ChangesetsSuite extends munit.FunSuite {
       dependents: Set[String] = Set.empty
   ): ModuleMetadata =
     ModuleMetadata(
-      version = version, dependencies = dependencies, transitiveDependencies = Set.empty, dependents = dependents,
+      version = version,
+      dependencies = dependencies.map(ModuleDependency(_, "compile")),
+      transitiveDependencies = Set.empty,
+      dependents = dependents.map(ModuleDependency(_, "compile")),
       transitiveDependents = Set.empty
     )
 
@@ -322,6 +326,214 @@ class ChangesetsSuite extends munit.FunSuite {
     val expected   = Changesets.Entry(VersionBump.Patch, "- Updated dependency: A (1.0.0 → 1.0.1)")
 
     assertEquals(expanded.get("B"), Some(expected))
+  }
+
+  test("Changesets.cascadeExpand - test-scope dependent is excluded by default, included when requested") {
+    val modules = Map(
+      "A" -> ModuleMetadata("1.0.0", Set.empty, Set.empty, Set(ModuleDependency("B", "test")), Set.empty),
+      "B" -> ModuleMetadata("1.0.0", Set(ModuleDependency("A", "test")), Set.empty, Set.empty, Set.empty)
+    )
+
+    val changesets = Changesets(Map("A" -> Changesets.Entry(VersionBump.Patch, "fix A")))
+
+    // By default (Set("compile", "bom")) a test-only dependent does not cascade
+    assertEquals(changesets.cascadeExpand(modules).get("B"), None)
+
+    // ...but it does when "test" is among the affected scopes
+    assertEquals(
+      changesets.cascadeExpand(modules, Set("compile", "test")).get("B").map(_.bump),
+      Some(VersionBump.Patch)
+    )
+  }
+
+  // --- Changesets.alwaysBump ---
+
+  test("Changesets.alwaysBump - adds a patch entry with a release-train description") {
+    val modules = Map(
+      "A"   -> module("1.0.0"),
+      "B"   -> module("0.3.0"),
+      "bom" -> module("0.1.45")
+    )
+
+    val changesets = Changesets(
+      Map(
+        "A" -> Changesets.Entry(VersionBump.Minor, "feat A"),
+        "B" -> Changesets.Entry(VersionBump.Patch, "fix B")
+      )
+    )
+
+    val expected = Changesets.Entry(VersionBump.Patch, "- Released alongside: `A@1.1.0`, `B@0.3.1`")
+
+    assertEquals(changesets.alwaysBump(Seq("bom"), modules).get("bom"), Some(expected))
+  }
+
+  test("Changesets.alwaysBump - nothing is added when there are no bumps") {
+    val modules = Map("bom" -> module("0.1.45"))
+
+    assertEquals(Changesets(Map.empty).alwaysBump(Seq("bom"), modules), Changesets(Map.empty))
+  }
+
+  test("Changesets.alwaysBump - an existing entry is preserved") {
+    val modules = Map(
+      "A"   -> module("1.0.0"),
+      "bom" -> module("0.1.45")
+    )
+
+    val changesets = Changesets(
+      Map(
+        "A"   -> Changesets.Entry(VersionBump.Patch, "fix A"),
+        "bom" -> Changesets.Entry(VersionBump.Minor, "explicit bom change")
+      )
+    )
+
+    val expected = Changesets.Entry(VersionBump.Minor, "explicit bom change")
+
+    assertEquals(changesets.alwaysBump(Seq("bom"), modules).get("bom"), Some(expected))
+  }
+
+  test("Changesets.alwaysBump - description includes modules bumped through cascading") {
+    val modules = Map(
+      "A"   -> module("1.0.0", dependents = Set("B")),
+      "B"   -> module("2.0.0", dependencies = Set("A")),
+      "bom" -> module("0.1.45")
+    )
+
+    val expanded = Changesets(Map("A" -> Changesets.Entry(VersionBump.Patch, "fix A")))
+      .cascadeExpand(modules)
+      .alwaysBump(Seq("bom"), modules)
+
+    assertEquals(expanded.get("bom").map(_.description), Some("- Released alongside: `A@1.0.1`, `B@2.0.1`"))
+    assertEquals(expanded.get("bom").map(_.bump), Some(VersionBump.Patch))
+  }
+
+  // --- Changesets.affects ---
+
+  test("Changesets.affects - plain compile edge is in compile scope") {
+    val result = Changesets.affects(ModuleDependency("dep", "compile"), Set("compile"))
+
+    assertEquals(result, true)
+  }
+
+  test("Changesets.affects - test-only edge is not in compile scope") {
+    val result = Changesets.affects(ModuleDependency("dep", "test"), Set("compile"))
+
+    assertEquals(result, false)
+  }
+
+  test("Changesets.affects - test->test edge is not in compile scope") {
+    val result = Changesets.affects(ModuleDependency("dep", "test->test"), Set("compile"))
+
+    assertEquals(result, false)
+  }
+
+  test("Changesets.affects - test->compile edge is not in compile scope (left-hand side is test)") {
+    val result = Changesets.affects(ModuleDependency("dep", "test->compile"), Set("compile"))
+
+    assertEquals(result, false)
+  }
+
+  test("Changesets.affects - compound `compile->compile;test->test` is in compile scope") {
+    val result = Changesets.affects(ModuleDependency("dep", "compile->compile;test->test"), Set("compile"))
+
+    assertEquals(result, true)
+  }
+
+  test("Changesets.affects - compound `compile->compile;test->test` is also in test scope") {
+    val result = Changesets.affects(ModuleDependency("dep", "compile->compile;test->test"), Set("test"))
+
+    assertEquals(result, true)
+  }
+
+  test("Changesets.affects - test edge is included when test is among the affected scopes") {
+    val result = Changesets.affects(ModuleDependency("dep", "test"), Set("compile", "test"))
+
+    assertEquals(result, true)
+  }
+
+  test("Changesets.affects - empty affected-scopes set never matches a concrete scope") {
+    val result = Changesets.affects(ModuleDependency("dep", "compile"), Set.empty[String])
+
+    assertEquals(result, false)
+  }
+
+  test("Changesets.affects - `\"*\"` in affected scopes matches any edge configuration") {
+    val result = Changesets.affects(ModuleDependency("dep", "test"), Set("*"))
+
+    assertEquals(result, true)
+  }
+
+  test("Changesets.affects - `\"*\"` as edge LHS matches when a scope is configured") {
+    val result = Changesets.affects(ModuleDependency("dep", "*->compile"), Set("compile"))
+
+    assertEquals(result, true)
+  }
+
+  // --- Changesets.affectedClosure ---
+
+  test("Changesets.affectedClosure - empty seed returns empty") {
+    val result   = Changesets.affectedClosure(Set.empty, Map("A" -> Set("B")))
+    val expected = Set.empty[String]
+
+    assertEquals(result, expected)
+  }
+
+  test("Changesets.affectedClosure - seed with no outgoing edges returns just the seed") {
+    val result   = Changesets.affectedClosure(Set("A"), Map.empty)
+    val expected = Set("A")
+
+    assertEquals(result, expected)
+  }
+
+  test("Changesets.affectedClosure - seed is always included even if it isn't a key in the edge map") {
+    val result   = Changesets.affectedClosure(Set("A"), Map("B" -> Set("C")))
+    val expected = Set("A")
+
+    assertEquals(result, expected)
+  }
+
+  test("Changesets.affectedClosure - linear chain A->B->C->D reaches every node") {
+    val edges = Map("A" -> Set("B"), "B" -> Set("C"), "C" -> Set("D"))
+
+    val result   = Changesets.affectedClosure(Set("A"), edges)
+    val expected = Set("A", "B", "C", "D")
+
+    assertEquals(result, expected)
+  }
+
+  test("Changesets.affectedClosure - branching: every direct and transitive dependent is reached") {
+    val edges = Map("A" -> Set("B", "C"), "B" -> Set("D"))
+
+    val result   = Changesets.affectedClosure(Set("A"), edges)
+    val expected = Set("A", "B", "C", "D")
+
+    assertEquals(result, expected)
+  }
+
+  test("Changesets.affectedClosure - diamond: a shared dependent is included once") {
+    val edges = Map("A" -> Set("B", "C"), "B" -> Set("D"), "C" -> Set("D"))
+
+    val result   = Changesets.affectedClosure(Set("A"), edges)
+    val expected = Set("A", "B", "C", "D")
+
+    assertEquals(result, expected)
+  }
+
+  test("Changesets.affectedClosure - cycle terminates and includes every node in the cycle") {
+    val edges = Map("A" -> Set("B"), "B" -> Set("A"))
+
+    val result   = Changesets.affectedClosure(Set("A"), edges)
+    val expected = Set("A", "B")
+
+    assertEquals(result, expected)
+  }
+
+  test("Changesets.affectedClosure - multiple seeds return the union of their reachable sets") {
+    val edges = Map("A" -> Set("B"), "X" -> Set("Y", "Z"))
+
+    val result   = Changesets.affectedClosure(Set("A", "X"), edges)
+    val expected = Set("A", "B", "X", "Y", "Z")
+
+    assertEquals(result, expected)
   }
 
   // --- Changesets.validateDescriptions ---

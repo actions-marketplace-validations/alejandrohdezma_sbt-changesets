@@ -1,5 +1,5 @@
 name: sbt-changesets
-description: Changeset-based versioning for Scala multi-module builds. Detect affected modules, publish snapshots, and release.
+description: Changeset-based versioning for Scala multi-module builds. Detect affected modules, apply changesets, and prepare releases.
 
 branding:
   icon: package
@@ -7,12 +7,8 @@ branding:
 
 inputs:
   mode:
-    description: "'detect' to validate changesets and output affected modules, 'snapshot' for PR snapshots, 'release' for main branch publishing"
+    description: "'detect' to validate changesets and emit the test/publish matrices, snapshot coordinates, and pending changeset count, 'apply-changesets' to bump versions and upsert the 'Version Packages' PR, 'snapshot-comment' to post a PR comment listing snapshot coordinates, 'release-tag' to create one GitHub release per row in `release-modules`"
     required: true
-  pr-number:
-    description: "PR number for snapshot comment (defaults to github.event.pull_request.number)"
-    required: false
-    default: ${{ github.event.pull_request.number }}
   github-token:
     description: "GitHub token for API operations (defaults to github.token)"
     required: false
@@ -25,22 +21,58 @@ inputs:
     description: "Skip changeset validation in detect mode while still computing affected modules (default: false)"
     required: false
     default: "false"
+  extra-command:
+    description: "Optional sbt command(s) to chain after `changesetVersion` in 'apply-changesets' mode. Useful for regenerating doc files (e.g. `mdoc`) so they get committed as part of the version PR. Use `;` to chain multiple commands."
+    required: false
+    default: ""
+  matrix:
+    description: "JSON array of rows as produced by the `detect` mode's `matrix` output. Used by `snapshot-comment` (validate-stage rows with `coordinate` and `validate-only`) and `release-tag` (release-stage rows with `version`; the notes body comes from the `changeset-changelogs` artifact instead)."
+    required: false
+    default: ""
+  pr-number:
+    description: "PR number to comment on in 'snapshot-comment' mode (defaults to github.event.pull_request.number)"
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  target:
+    description: "Branch (or commit SHA) to target for the created GitHub releases (only used in 'release-tag' mode)"
+    required: false
+    default: main
 
 outputs:
-  affected:
-    description: "JSON array of affected module names (only set when mode is 'detect')"
-    value: ${{ steps.detect.outputs.affected }}
-  result:
-    description: "'version-pr' if a version PR was created/updated, 'published' if artifacts were published, 'no-changes' otherwise"
-    value: ${{ steps.release-result.outputs.result }}
-  branch:
-    description: "The release branch name (only set when result is 'version-pr')"
-    value: ${{ steps.release-result.outputs.branch }}
+  matrix:
+    description: "The work matrix for this run, shape depending on `stage`. When `stage == 'validate'`, an array of `{module, scala-version, version, coordinate, validate-only}` rows (publish-matrix dimensions + snapshot Maven coordinate for `snapshot-comment`; `validate-only: true` marks a module that must be built and tested but not published, because this change will never release it). When `stage == 'release'`, an array of `{module, scala-version, version}` rows (publish-matrix dimensions only; the release notes travel to `release-tag` as the `changeset-changelogs` artifact, never through this output, since a job output containing a masked secret is silently dropped). Empty array otherwise. Pass to `snapshot-comment` / `release-tag` modes' `matrix` input; consume as `matrix.include` for the validate/publish jobs. (only set when mode is 'detect')"
+    value: ${{ steps.detect.outputs.matrix }}
+  stage:
+    description: "The workflow stage classification for this run: `validate` (PR with affected modules), `apply-changesets` (push-to-main with pending changeset files), `release` (push-to-main with VERSION bumps to publish). Empty string for events with no downstream work. Use as the single gating condition for downstream jobs. (only set when mode is 'detect')"
+    value: ${{ steps.detect.outputs.stage }}
 
 runs:
   using: composite
   steps:
     # ─── Detect mode ─────────────────────────────
+    # Validates that every changed module has a corresponding .changeset/*.md entry,
+    # then emits two outputs:
+    #   - `stage`: single dispatch classification — `validate` (PR with affected
+    #     modules), `apply-changesets` (push with pending changesets), `release`
+    #     (push with VERSION bumps), or empty (nothing to do). Consumers gate every
+    #     downstream job on this single value.
+    #   - `matrix`: the work matrix for this run. Shape depends on `stage`:
+    #       - `validate`: `[{module, scala-version, version, coordinate,
+    #         validate-only}, ...]` — publish-matrix dimensions plus snapshot Maven
+    #         coordinate for `snapshot-comment`. `validate-only: true` rows must be
+    #         built and tested but not published: the module is only reachable from
+    #         the change through scopes outside `changesetAffectedScopes` (e.g. a
+    #         `dependsOn(x % Test)` consumer), or only its own test sources changed.
+    #         Gate the snapshot publish step on `!matrix.validate-only`.
+    #       - `release`:  `[{module, scala-version, version}, ...]` — publish-matrix
+    #         dimensions only. The release notes for those modules travel to
+    #         `release-tag` mode as the `changeset-changelogs` artifact, never
+    #         through this output: GitHub Actions silently drops a job output whose
+    #         value contains a masked secret, and a single changelog sentence
+    #         containing a credential as a substring would sink the whole release.
+    #       - otherwise: `[]`.
+    # Run on every event; the consumer routes the single matrix into the right
+    # downstream jobs by gating on `stage`.
 
     - name: Detect affected modules
       if: inputs.mode == 'detect'
@@ -49,73 +81,62 @@ runs:
       env:
         CHANGESET_SKIP_VALIDATION: ${{ inputs.skip-validation }}
       run: |
-        sbt changesetAffected || {
-          if [ -n "${{ inputs.error-help-url }}" ]; then
-            echo "See: ${{ inputs.error-help-url }}"
-          fi
-          exit 1
-        }
-        echo "affected=$(jq -c . target/changeset/affected.json)" >> "$GITHUB_OUTPUT"
-
-    # ─── Snapshot mode ───────────────────────────
-
-    - name: Publish snapshots
-      if: inputs.mode == 'snapshot'
-      shell: bash
-      run: sbt publishSnapshot
-
-    - name: Comment snapshot coordinates on PR
-      if: inputs.mode == 'snapshot'
-      shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.github-token }}
-      run: |
-        COORDINATES_FILE="target/changeset/snapshot-coordinates.json"
-
-        if [ ! -f "$COORDINATES_FILE" ]; then
-          echo "No snapshot coordinates file found. Skipping comment."
-          exit 0
-        fi
-
-        BLOCKS=$(jq -r '.[] | "```scala\n\(.coordinate)\n```"' "$COORDINATES_FILE")
-        BODY_FILE=$(mktemp)
-
-        cat > "$BODY_FILE" <<EOF
-        ### Snapshot releases
-
-        Install with:
-
-        ${BLOCKS}
-
-        _Updated on each push to this PR._
-        EOF
-
-        # Try to update the last bot comment, fall back to creating a new one
-        gh pr comment "${{ inputs.pr-number }}" --edit-last --body-file "$BODY_FILE" 2>/dev/null \
-          || gh pr comment "${{ inputs.pr-number }}" --body-file "$BODY_FILE"
-
-        rm -f "$BODY_FILE"
-
-    # ─── Release mode ────────────────────────────
-
-    - name: Check for pending changesets
-      if: inputs.mode == 'release'
-      id: check
-      shell: bash
-      run: |
         COUNT=$(find .changeset -name "*.md" ! -name "README.md" 2>/dev/null | wc -l | tr -d ' ')
-        echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+        MATRIX="[]"
+        STAGE=""
 
-    # ─── Release: version PR path ────────────────
+        case "$GITHUB_EVENT_NAME" in
+          pull_request)
+            sbt "changesetMatrix validate" || {
+              if [ -n "${{ inputs.error-help-url }}" ]; then
+                echo "See: ${{ inputs.error-help-url }}"
+              fi
+              exit 1
+            }
+            MATRIX=$(jq -c . target/changeset/matrix.json)
+            [ "$MATRIX" != "[]" ] && STAGE="validate"
+            ;;
+          push)
+            if [ "$COUNT" != "0" ]; then
+              STAGE="apply-changesets"
+            else
+              sbt "changesetMatrix release"
+              MATRIX=$(jq -c . target/changeset/matrix.json)
+              [ "$MATRIX" != "[]" ] && STAGE="release"
+            fi
+            ;;
+        esac
+
+        echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+        echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+    - name: Upload release notes
+      if: inputs.mode == 'detect' && steps.detect.outputs.stage == 'release'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: changeset-changelogs
+        path: target/changeset/changelogs.json
+        retention-days: 1
+        overwrite: true
+
+    # ─── Apply-changesets ────────────────────────
+    # Bumps VERSION files (via `changesetVersion`) and upserts the
+    # "Version Packages" pull request on the `changeset-release/main` branch.
+    # Run after a developer's PR carrying changeset files is merged to main.
 
     - name: Apply changesets
-      if: inputs.mode == 'release' && steps.check.outputs.count != '0'
-      id: version
+      if: inputs.mode == 'apply-changesets'
+      id: apply-changesets
       shell: bash
       env:
         RELEASE: "true"
+        EXTRA_COMMAND: ${{ inputs.extra-command }}
       run: |
-        sbt changesetVersion
+        if [ -n "$EXTRA_COMMAND" ]; then
+          sbt "changesetVersion; $EXTRA_COMMAND"
+        else
+          sbt changesetVersion
+        fi
 
         echo "body<<EOF" >> "$GITHUB_OUTPUT"
         jq -r '"## Version Packages\n\n" + ([.[] | "- **\(.module)**: \(.old_version) → \(.new_version)"] | join("\n"))' \
@@ -123,55 +144,125 @@ runs:
         echo "EOF" >> "$GITHUB_OUTPUT"
 
     - name: Create version PR
-      if: inputs.mode == 'release' && steps.check.outputs.count != '0'
+      if: inputs.mode == 'apply-changesets'
       uses: alejandrohdezma/actions/upsert-pr@v1
       with:
         branch: changeset-release/main
         title: "Changesets: Version Packages"
         message: "Version Packages [skip ci]"
-        body: ${{ steps.version.outputs.body }}
+        body: ${{ steps.apply-changesets.outputs.body }}
         github-token: ${{ inputs.github-token }}
 
-    # ─── Release: publish + releases path ────────
+    # ─── Snapshot-comment ────────────────────────
+    # Posts (or edits) a PR comment listing snapshot coordinates produced by a matrix
+    # snapshot publish. Consumes the validate-stage `matrix` from `detect` — rows
+    # carry `module`, `scala-version`, `version`, `coordinate`, and `validate-only`;
+    # this step drops `validate-only` rows (they publish no snapshot) and dedupes by
+    # module so each release is listed once. Posts nothing when no rows remain.
 
-    - name: Publish and create releases
-      if: inputs.mode == 'release' && steps.check.outputs.count == '0'
+    - name: Post snapshot coordinates comment
+      if: inputs.mode == 'snapshot-comment'
       shell: bash
       env:
-        RELEASE: "true"
         GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        MATRIX: ${{ inputs.matrix }}
       run: |
-        sbt "generatePublishMarkers; +publish; changesetRelease"
+        PUBLISHED=$(echo "$MATRIX" | jq -c 'map(select(."validate-only" != true))')
 
-        RELEASE_FILE="target/changeset/release.json"
-
-        if [ ! -f "$RELEASE_FILE" ]; then
-          echo "No release file found. Skipping release creation."
+        if [ "$PUBLISHED" = "[]" ]; then
+          echo "No snapshots were published (every affected module is validate-only). Skipping comment."
           exit 0
         fi
 
-        jq -c '.[]' "$RELEASE_FILE" | while read -r release; do
-          TAG=$(echo "$release" | jq -r '.tag')
-          BODY=$(echo "$release" | jq -r '.body')
-          NOTES_FILE=$(mktemp)
-          echo "$BODY" > "$NOTES_FILE"
+        BLOCKS=$(echo "$PUBLISHED" | jq -r 'group_by(.module) | map(.[0]) | .[] | "```scala\n\(.coordinate)\n```"')
+        BODY_FILE=$(mktemp)
+        cat > "$BODY_FILE" <<EOF
+        ### Snapshot releases
 
-          echo "Creating release: $TAG"
-          gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" --target main
+        Install with:
+        ${BLOCKS}
 
-          rm -f "$NOTES_FILE"
-        done
+        _Updated on each push to this PR._
+        EOF
+        gh pr comment "$PR_NUMBER" --edit-last --body-file "$BODY_FILE" 2>/dev/null \
+          || gh pr comment "$PR_NUMBER" --body-file "$BODY_FILE"
+        rm -f "$BODY_FILE"
 
-    # ─── Release: set outputs ────────────────────
+    # ─── Release-tag ─────────────────────────────
+    # Iterates the release-stage `matrix` (as produced by `detect`) and creates one
+    # GitHub release per distinct module via the Octokit client in `actions/github-
+    # script`. Rows carry `module`, `scala-version` and `version`; duplicate module
+    # rows (from cross-built modules) are deduped in-script. The notes body comes
+    # from the `changeset-changelogs` artifact that `detect` uploaded in this same
+    # run — downloaded here so consumers need no checkout and no extra step.
+    # Existing tags are skipped, making reruns idempotent. Per-entry failures are
+    # collected and reported via `core.setFailed` at the end — a single bad release
+    # doesn't sink the rest. Run after the publish job(s) succeed.
 
-    - name: Set release outputs
-      if: inputs.mode == 'release'
-      id: release-result
-      shell: bash
-      run: |
-        if [ "${{ steps.check.outputs.count }}" != "0" ]; then
-          echo "result=version-pr" >> "$GITHUB_OUTPUT"
-          echo "branch=changeset-release/main" >> "$GITHUB_OUTPUT"
-        else
-          echo "result=published" >> "$GITHUB_OUTPUT"
-        fi
+    - name: Download release notes
+      if: inputs.mode == 'release-tag'
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: changeset-changelogs
+
+    - name: Create GitHub releases
+      if: inputs.mode == 'release-tag'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        MATRIX: ${{ inputs.matrix }}
+        TARGET: ${{ inputs.target }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+
+          const matrix = JSON.parse(process.env.MATRIX);
+          const target = process.env.TARGET;
+          const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+
+          const changelogs = fs.existsSync('changelogs.json')
+            ? JSON.parse(fs.readFileSync('changelogs.json', 'utf8'))
+            : {};
+
+          // Matrix has one row per (module, scala-version); dedupe to one release per module.
+          const seen = new Set();
+          const failures = [];
+
+          for (const row of matrix) {
+            if (seen.has(row.module)) continue;
+            seen.add(row.module);
+
+            const tag = `${row.module}@${row.version}`;
+
+            try {
+              await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              core.info(`${tag} already exists; skipping.`);
+              continue;
+            } catch (err) {
+              if (err.status !== 404) {
+                core.warning(`${tag}: lookup failed (${err.status}): ${err.message}`);
+                failures.push(tag);
+                continue;
+              }
+            }
+
+            try {
+              await github.rest.repos.createRelease({
+                owner, repo,
+                tag_name: tag,
+                target_commitish: target,
+                name: tag,
+                body: changelogs[row.module] ?? row.changelog ?? '',
+              });
+              core.info(`Created ${tag}`);
+            } catch (err) {
+              core.error(`${tag}: ${err.message}`);
+              failures.push(tag);
+            }
+          }
+
+          if (failures.length > 0) {
+            core.setFailed(`Failed to create ${failures.length} release(s): ${failures.join(', ')}`);
+          }
