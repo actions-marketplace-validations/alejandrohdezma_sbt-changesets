@@ -238,6 +238,9 @@ object Changesets {
     * the frontmatter is preserved as the description. A single changeset file can reference multiple modules — they all
     * share the same description.
     *
+    * Several changeset files can reference the same module. The module then gets the highest of their bumps, and their
+    * descriptions joined by a blank line, in file-name order.
+    *
     * Malformed frontmatter lines are accumulated as errors rather than throwing. Returns a `Left` with all error
     * messages if any lines fail to parse, or a `Right` with the parsed entries if all lines are valid.
     *
@@ -253,6 +256,7 @@ object Changesets {
       changesetDir
         .listFiles()
         .filter(file => file.getName.endsWith(".md") && file.getName != "README.md")
+        .sortBy(_.getName)
         .flatMap { file =>
           val afterFirst = IO.readLines(file).dropWhile(_.trim != "---").drop(1)
 
@@ -274,12 +278,14 @@ object Changesets {
         case lines                           =>
           val parsed = lines.collect { case Right(line) => line }
 
-          Right(
-            Changesets(
-              parsed.collect { case (name, Some(entry)) => name -> entry }.toMap,
-              parsed.collect { case (name, None) => name }.toSet
-            )
-          )
+          val entries = parsed.collect { case (name, Some(entry)) => name -> entry }
+            .groupBy(_._1)
+            .map { case (name, named) =>
+              val all = named.map(_._2)
+              name -> Entry(all.map(_.bump).reduce(_.max(_)), all.map(_.description).distinct.mkString("\n\n"))
+            }
+
+          Right(Changesets(entries, parsed.collect { case (name, None) => name }.toSet))
       }
 
   /** Extracts the changelog entry for a specific version from a CHANGELOG.md file.
