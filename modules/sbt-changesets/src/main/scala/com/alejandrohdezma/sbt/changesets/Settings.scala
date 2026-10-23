@@ -53,12 +53,12 @@ object Settings {
     * the version is the raw content of the `VERSION` file (used for CI releases).
     *
     * The `SNAPSHOT_MODULES` env var (again with a system-property fallback) optionally carries the validate-stage
-    * `changesetMatrix` JSON (the array of `{module, ...}` rows). When set, the `module` of every row names a module
-    * that is being snapshot-published, and only those are suffixed; every other module reports the raw `VERSION`
-    * content instead — so an unchanged inter-module dependency is referenced at its already-published release version
-    * rather than at a snapshot that was never published. An empty or absent value means all modules are suffixed (the
-    * default for local `publishLocal` and any non-CI use); a value that cannot be parsed as that matrix fails the
-    * build.
+    * `changesetMatrix` JSON (the array of `{module, ...}` rows). When set, the `module` of every row that is not marked
+    * `validate-only` names a module that is being snapshot-published, and only those are suffixed; every other module
+    * reports the raw `VERSION` content instead — so an unchanged inter-module dependency, or a module that is only
+    * built and tested, is referenced at its already-published release version rather than at a snapshot that was never
+    * published. An empty or absent value means all modules are suffixed (the default for local `publishLocal` and any
+    * non-CI use); a value that cannot be parsed as that matrix fails the build.
     *
     * If a module is missing its `VERSION` file, the build fails.
     */
@@ -75,8 +75,15 @@ object Settings {
         .getOrElse(Snapshot.timestamp)
 
       val parseSnapshotModules = (raw: String) =>
-        Try(ConfigFactory.parseString(s"rows = $raw").getConfigList("rows").asScala.map(_.getString("module")).toSet)
-          .getOrElse(sys.error("Failed to parse SNAPSHOT_MODULES"))
+        Try {
+          ConfigFactory
+            .parseString(s"rows = $raw")
+            .getConfigList("rows")
+            .asScala
+            .filterNot(row => row.hasPath("validate-only") && row.getBoolean("validate-only"))
+            .map(_.getString("module"))
+            .toSet
+        }.getOrElse(sys.error("Failed to parse SNAPSHOT_MODULES"))
 
       val snapshotModules =
         sys.env

@@ -31,3 +31,5 @@ commands += Command.command("clearSnapshotModules") { state =>
 lazy val `module-a` = module.settings(assertions)
 
 lazy val `module-b` = module.settings(assertions)
+
+lazy val `module-c` = module.settings(assertions)
