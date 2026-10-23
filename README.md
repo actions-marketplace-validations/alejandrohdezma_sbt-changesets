@@ -11,7 +11,7 @@ Changeset-based versioning for Scala multi-module builds (sbt plugin + GitHub Ac
 Add the plugin to your `project/plugins.sbt`:
 
 ```sbt
-addSbtPlugin("com.alejandrohdezma" % "sbt-changesets" % "0.15.1")
+addSbtPlugin("com.alejandrohdezma" % "sbt-changesets" % "0.15.2")
 ```
 
 The same coordinate is published for both **sbt 1.x** (Scala 2.12) and **sbt 2.x** (Scala 3).
@@ -110,7 +110,7 @@ The composite [GitHub Action](#github-actions) bundles this flow into `detect` m
 
 ## GitHub Actions
 
-This repository also provides a composite GitHub Action that orchestrates the full CI workflow. Reference it as `alejandrohdezma/sbt-changesets@v0.15.1` and choose a mode depending on the context.
+This repository also provides a composite GitHub Action that orchestrates the full CI workflow. Reference it as `alejandrohdezma/sbt-changesets@v0.15.2` and choose a mode depending on the context.
 
 ### `detect` mode
 
@@ -146,7 +146,7 @@ jobs:
         with: { fetch-depth: 0 }
 
       - id: changesets
-        uses: alejandrohdezma/sbt-changesets@v0.15.1
+        uses: alejandrohdezma/sbt-changesets@v0.15.2
         with:
           mode: detect
           error-help-url: https://your-repo/docs/versioning  # shown on validation failure
@@ -174,7 +174,7 @@ jobs:
     if: needs.detect.outputs.stage == 'validate'
     runs-on: ubuntu-latest
     steps:
-      - uses: alejandrohdezma/sbt-changesets@v0.15.1
+      - uses: alejandrohdezma/sbt-changesets@v0.15.2
         with:
           mode: snapshot-comment
           matrix: ${{ needs.detect.outputs.matrix }}
@@ -182,7 +182,7 @@ jobs:
 
 `SNAPSHOT_SUFFIX` (e.g. `${{ github.run_id }}-${{ github.run_attempt }}`) is set on both `detect` and `validate` so the coordinates resolved up-front in `detect` match the artifacts published by the `validate` matrix. Because every matrix cell in a single workflow run shares the same `SNAPSHOT_SUFFIX`, the per-Scala-version publishes that make up one module produce consistent versions. The `coordinate` field carried in each matrix row is rendered from each module's sbt `organization` setting, so per-module org overrides (e.g. `com.permutive.metrics`) are respected without any consumer-side hardcoding. Snapshot publishes are intended for private monorepos only — exposing publishing credentials on PRs in public repositories is a security risk.
 
-`SNAPSHOT_MODULES` (optional, read by `versionFromFile` with the same env / system-property fallback as `SNAPSHOT_SUFFIX`) carries the validate-stage matrix itself — set it to `${{ needs.detect.outputs.matrix }}`, as above. `versionFromFile` reads the `module` of every row to learn which modules are being snapshot-published and suffixes only those; every other module reports the raw `VERSION` content instead. This matters whenever an affected module `dependsOn` an *unchanged* sibling: without it every module is suffixed, so the published POM would reference the sibling at `…-SNAPSHOT` even though no such snapshot was published (it never changed), and resolution fails. With it, the sibling keeps its released version and the coordinate resolves. An empty or absent `SNAPSHOT_MODULES` (e.g. a local `publishLocal`) means every module is suffixed, as before.
+`SNAPSHOT_MODULES` (optional, read by `versionFromFile` with the same env / system-property fallback as `SNAPSHOT_SUFFIX`) carries the validate-stage matrix itself — set it to `${{ needs.detect.outputs.matrix }}`, as above. `versionFromFile` reads the `module` of every row not marked `validate-only` to learn which modules are being snapshot-published and suffixes only those; every other module reports the raw `VERSION` content instead. A `validate-only` row is built and tested but never published (the `publish` step above skips it), so it must not be suffixed either: an affected module that depends on it, or a BOM that lists it, would otherwise reference a snapshot that does not exist. This matters whenever an affected module `dependsOn` an *unchanged* sibling: without it every module is suffixed, so the published POM would reference the sibling at `…-SNAPSHOT` even though no such snapshot was published (it never changed), and resolution fails. With it, the sibling keeps its released version and the coordinate resolves. An empty or absent `SNAPSHOT_MODULES` (e.g. a local `publishLocal`) means every module is suffixed, as before.
 
 #### Customising the `coordinate` per module
 
@@ -203,7 +203,7 @@ Posts (or edits) a PR comment listing snapshot coordinates produced by a matrix 
     needs: [detect, validate]
     runs-on: ubuntu-latest
     steps:
-      - uses: alejandrohdezma/sbt-changesets@v0.15.1
+      - uses: alejandrohdezma/sbt-changesets@v0.15.2
         with:
           mode: snapshot-comment
           matrix: ${{ needs.detect.outputs.matrix }}
@@ -227,7 +227,7 @@ Loops over the release-stage `matrix` (as produced by `detect`) and creates one 
     permissions:
       contents: write
     steps:
-      - uses: alejandrohdezma/sbt-changesets@v0.15.1
+      - uses: alejandrohdezma/sbt-changesets@v0.15.2
         with:
           mode: release-tag
           matrix: ${{ needs.detect.outputs.matrix }}
@@ -252,7 +252,7 @@ jobs:
       - uses: actions/checkout@@v4
         with: { fetch-depth: 0 }
 
-      - uses: alejandrohdezma/sbt-changesets@v0.15.1
+      - uses: alejandrohdezma/sbt-changesets@v0.15.2
         with:
           mode: apply-changesets
           # Optional: regenerate docs as part of the same version-PR commit.
@@ -281,7 +281,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: alejandrohdezma/sbt-changesets@v0.15.1
+      - uses: alejandrohdezma/sbt-changesets@v0.15.2
         with:
           mode: release-tag
           matrix: ${{ needs.detect.outputs.matrix }}
