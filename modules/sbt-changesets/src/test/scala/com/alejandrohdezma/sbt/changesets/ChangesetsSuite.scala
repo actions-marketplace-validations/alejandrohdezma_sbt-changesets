@@ -79,6 +79,46 @@ class ChangesetsSuite extends munit.FunSuite {
     assertEquals(Changesets.parseFrom(dir), expected)
   }
 
+  withChangesetDir(
+    "b-feature.md" ->
+      """---
+        |"my-module": minor
+        |---
+        |
+        |Added a feature.
+        |""".stripMargin,
+    "a-fix.md" ->
+      """---
+        |"my-module": patch
+        |"other-module": patch
+        |---
+        |
+        |Fixed a bug.
+        |""".stripMargin,
+    "c-docs.md" ->
+      """---
+        |"my-module": patch
+        |---
+        |
+        |Improved the docs.
+        |""".stripMargin
+  ).test("Changesets.parseFrom - several files for one module merge into its highest bump and every description") {
+    dir =>
+      val expected = Right(
+        Changesets(
+          Map(
+            "my-module" -> Changesets.Entry(
+              VersionBump.Minor,
+              "Fixed a bug.\n\nAdded a feature.\n\nImproved the docs."
+            ),
+            "other-module" -> Changesets.Entry(VersionBump.Patch, "Fixed a bug.")
+          )
+        )
+      )
+
+      assertEquals(Changesets.parseFrom(dir), expected)
+  }
+
   withChangesetDir {
     "bad.md" ->
       """---

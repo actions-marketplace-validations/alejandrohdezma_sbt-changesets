@@ -1,16 +1,20 @@
 # Without SNAPSHOT_MODULES every module gets the snapshot suffix.
 > module-a/assertSnapshot
 > module-b/assertSnapshot
+> module-c/assertSnapshot
 
-# With SNAPSHOT_MODULES carrying a matrix that names only module-a, the unchanged sibling
-# module-b (absent from the matrix) falls back to its raw release version.
+# With SNAPSHOT_MODULES carrying a matrix that publishes only module-a, the unchanged sibling
+# module-b (absent from the matrix) and module-c (a validate-only row, built and tested but
+# never published) fall back to their raw release versions.
 > setSnapshotModules
 > reload
 > module-a/assertSnapshot
 > module-b/assertRelease
+> module-c/assertRelease
 
 # Clearing the property restores the default and avoids polluting the shared scripted JVM.
 > clearSnapshotModules
 > reload
 > module-a/assertSnapshot
 > module-b/assertSnapshot
+> module-c/assertSnapshot
